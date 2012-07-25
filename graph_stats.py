@@ -336,6 +336,41 @@ def get_node_list_props(start_num, lg2_bound):
 
 	return prop_dict
 
+def get_node_list_props_from_list(start_list, lg2_bound):
+	"""
+	Returns a property dictionary for the bounded collatz sequences 
+	that go through an element in start_list and are bounded by lg2_bound.
+	
+	Note:  This is much more memory efficient than generating a 
+	complete list and then computing the properties!
+	
+	CAVEAT NOTE: !!!!  We include start_list in the prop_dict!!!
+	
+	Also:  start_list is assumed to be a list of odd integers.
+	
+	"""
+
+	cur_level = start_list
+	prop_dict = get_stats(cur_level)
+	cur_prop_dict = {}
+	
+	#Creating the ith graph
+	while len(cur_level) > 0:
+		next_level = []
+		for target in cur_level:
+			temp = compute_up_level(target, 2+ int((lg2_bound - get_length(target))/2)) #Note:  How many terms we need
+			if 1 in temp:										#depends on the length.  This speeds things up
+				temp.remove(1)									#even with an extra call to get_length.
+			trimmed_temp = [x for x in temp if x<= 2**lg2_bound]
+			next_level.extend(trimmed_temp)
+		cur_level = [x for x in next_level]	
+		cur_prop_dict = get_stats(cur_level)
+		prop_dict = merge_props(cur_prop_dict, prop_dict)
+
+	return prop_dict
+
+
+
 
 #################################
 #
@@ -532,14 +567,55 @@ def graph_stats_nograph(start_num, min_lg2_bound, max_lg2_bound):
 
 import cloud 
 
+#chromebox Hardware contraints 
+NUM_CORES = 32		#MUST BE > 0!!! No cores, no computation.
+MAX_BOUND_ON_MACHINE = 32
+
+
 def cloud_call_of_get_node_list_props(data):
 
-	start_num = data[0]
+	start_list = data[0]
 	lg2_bound = data[1]
 	
-	prop_dict = get_node_list_props(start_num,lg2_bound)
+	prop_dict = get_node_list_props_from_list(start_list,lg2_bound)
 	return prop_dict
 	
+	
+"""
+NOTES on load leveling
+
+From observation we have the following heuristics.  The 2^32 bound requires approximately 4 GB of 
+memory.  Ignoring overhead, the amount of total compute time doubles each time the bound doubles. The 
+amount of memory required for the entire computation also approximately doubles. (This second is 
+basically observing that the tree width which controls the amount of memory needed for the computation
+doubles.)  The second can be controlled by computing parts of the tree serially rather than trying to 
+do it all in parallel.  
+
+Example:  For 2^33, we can first break the job into 16 parts and then run the first 8 parts (which is 
+approximately a 2^32 job maxing out memory) and then run the second 8 parts.  This doesn't actually 
+double the compute time if the machine compute is saturated although it does add some overhead.
+8385.854750  seconds for an actual run verus 2*(3305.208207 ) ~ 6620 'expected'.  
+
+Another minor factor:  2^30 32bit int's per GB  means that when the bound goes over 2^32, some of 
+the ints become long ints which will increase required memory on those ints and will increase compute 
+time.  (We just added another limb.)
+
+So if we have NUM_CORES and MAX_BOUND_ON_MACHINE  (which in the chromebox would be '8' with hyperthreading
+and 32 the second being a parameter reflecting memory contraints) then if i>MAX_BOUND_ON_MACHINE we
+need to split the job into (i-MAX_BOUND_ON_MACHINE + 1) parts run serially each containing NUM_CORES jobs.
+This means we need to partition the list of numbers being farmed out into NUM_CORES*(i-MAX_BOUND_ON_MACHINE + 1)
+lists where the work to do each list is hopefully equally balanced.
+
+The tricky part of balancing the work of the lists is that different numbers require different times 
+to finish.  However ultimately the hueristic that for every number not congruent to 0 modulo 3, eventually
+the number of bounded descendent nodes will double each time the bound is increased means that if we 
+have enough numbers the times should approximately balance out on sets of equal sizes.  The time of the 
+computation is proportional to the number of nodes in the tree descending from that number which is 
+proportional to 2**(bound - length_of_number) if the number is congruent to 1 mod 3 and  
+2**(bound - length_of_number -1) if the number is congruent to 2 mod 3.  Therefore to a first approxmation
+it is enough to approximately balance the sizes.  But a more accurate balancing should balance both 
+the sizes and the numbers of 1 mod 3 versus 2 mod 3.
+"""
 
 def picloud_graph_stats_nograph(start_num, min_lg2_bound, max_lg2_bound):
 	"""
@@ -559,9 +635,12 @@ def picloud_graph_stats_nograph(start_num, min_lg2_bound, max_lg2_bound):
 		start_time = time.time()
 		start_clock = time.clock()
 		
-		### Do the initial levels
+		### Do the initial levels creating a list of nodes to farm off to the cloud as we go
 		cur_level = [start_num]
-		for level in range(5):  #TUNE THIS BOUND FOR PARALLELISM  
+		farm_list = []
+				
+		FARM_BREAK_POINT = 14	#TUNE THIS BOUND FOR PARALLELISM.  Bigger means more nodes in farm_list and more compute time to start.
+		for level in range(100):  #TUNE THIS BOUND FOR PARALLELISM  In practice make this large enough so that the subtree defined by the FARM_BREAK_POINT bound is completely computed.
 			cur_prop_dict = get_stats(cur_level)
 			prop_dict = merge_props(cur_prop_dict, prop_dict)
 			next_level = []
@@ -571,24 +650,64 @@ def picloud_graph_stats_nograph(start_num, min_lg2_bound, max_lg2_bound):
 					temp.remove(1)									#even with an extra call to get_length.
 				trimmed_temp = [x for x in temp if x<= 2**i]
 				next_level.extend(trimmed_temp)
-			cur_level = [x for x in next_level]			
+			cur_level = [x for x in next_level if get_length(x) <FARM_BREAK_POINT]			
+			farm_list.extend([x for x in next_level if get_length(x) >= FARM_BREAK_POINT])
 		
+		cur_level.extend(farm_list)
 		###Split the list (which is cur_level).  
 		add_list = [x for x in cur_level if x%3 == 0]
 		split_list = [x for x in cur_level if x%3 != 0]
-		print "Subtree count: %d "%(len(split_list))
+		split_list.sort()
+		split_list1 = [x for x in split_list if x%3 == 1]
+		split_list2 = [x for x in split_list if x%3 == 2]
+		split_list2.reverse()
 		
+		print "Subtree count: %d "%(len(split_list))
+		print split_list[0:20]
+
 		###Add the mod3 = 0 class to prop_dict. 
 		prop_dict = merge_props(prop_dict, get_stats(add_list))
+
+		###Partition the split_list into sublists for jobs.		
+		if i>MAX_BOUND_ON_MACHINE:
+			num_partitions =  NUM_CORES*(i-MAX_BOUND_ON_MACHINE + 1)
+		else:
+			num_partitions = NUM_CORES
 		
+		temp = {}
+		for k in range(num_partitions):	
+			temp1 = [split_list1[n] for n in range(k,len(split_list1),num_partitions)]
+			temp2 = [split_list2[n] for n in range(k,len(split_list2),num_partitions)]
+			temp[k] = temp1 + temp2
+		print "Partition %d has %d mod 1 nodes and %d mod 2 nodes"%(k,len(temp1),len(temp2))
+		split_list = []
+		for k in range(num_partitions):
+			split_list.append(temp[k])
+
+
 		###  Send the rest of the list out as separate jobs to the cloud.
 		cloud_split_list = [ (x,i) for x in split_list]
+		marker = 0
+		while marker < num_partitions:
+			print "Running cloud jobs %d to %d"%(marker,marker+NUM_CORES-1)
+			jids = cloud.map(cloud_call_of_get_node_list_props,cloud_split_list[marker:marker + NUM_CORES],_profile=True, _type = "f2")  #Send the get_node_list jobs to cloud
+			cloud_results = cloud.result(jids) #Collect the property dictionaries back from cloud
+			marker = marker + NUM_CORES
+			
+			### Merge the separate jobs back into the property list.
+			for c_dict in cloud_results:		#Merge cloud results together
+				prop_dict = merge_props(c_dict,prop_dict)
+			
+		
+		"""
 		jids = cloud.map(cloud_call_of_get_node_list_props,cloud_split_list)  #Send the get_node_list jobs to cloud
 		cloud_results = cloud.result(jids) #Collect the property dictionaries back from cloud
 		
 		### Merge the separate jobs back into the property list.
 		for c_dict in cloud_results:		#Merge cloud results together
 			prop_dict = merge_props(c_dict,prop_dict)
+		"""
+
 		
 		prop_time = time.time()
 		prop_clock = time.clock()
